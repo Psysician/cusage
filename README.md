@@ -36,6 +36,7 @@ cusage                      # daily report (default)
 cusage monthly              # monthly report
 cusage --since 20260220     # filter from date
 cusage --until 20260228     # filter until date
+cusage --breakdown          # cost breakdown with per-token rates
 cusage --help               # show help
 ```
 

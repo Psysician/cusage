@@ -16,7 +16,7 @@ const YELLOW = '\x1b[33m';
 const WHITE = '\x1b[37m';
 const GRAY = '\x1b[90m';
 
-// ─── Codex pricing (per million tokens) ───────────────────
+// ─── Pricing (per million tokens) ────────────────────────
 // OpenAI has no cache write cost. Cache read = 10% of input price.
 const CODEX_PRICING = {
   'gpt-5-codex':   { input: 1.25,  cached: 0.125,  output: 10.0 },
@@ -24,12 +24,32 @@ const CODEX_PRICING = {
   'gpt-5.2-codex': { input: 1.75,  cached: 0.175,  output: 14.0 },
   'gpt-5.3-codex': { input: 1.75,  cached: 0.175,  output: 14.0 },
 };
-const FALLBACK_PRICING = { input: 1.75, cached: 0.175, output: 14.0 };
+const CODEX_FALLBACK = { input: 1.75, cached: 0.175, output: 14.0 };
+
+// Claude pricing estimated from model family (breakdown view only)
+const CLAUDE_PRICING = {
+  opus:   { input: 15.0,  cached: 1.50,  output: 75.0,  cacheWrite: 18.75 },
+  sonnet: { input: 3.0,   cached: 0.30,  output: 15.0,  cacheWrite: 3.75 },
+  haiku:  { input: 0.80,  cached: 0.08,  output: 4.0,   cacheWrite: 1.0 },
+};
+
 const M = 1_000_000;
 
-function codexCost(model, nonCachedInput, cached, output) {
-  const p = CODEX_PRICING[model] || FALLBACK_PRICING;
-  return (nonCachedInput * p.input + cached * p.cached + output * p.output) / M;
+function getModelPricing(provider, modelName) {
+  if (provider === 'codex') {
+    const p = CODEX_PRICING[modelName] || CODEX_FALLBACK;
+    return { input: p.input, cached: p.cached, output: p.output, cacheWrite: 0 };
+  }
+  const n = modelName.toLowerCase();
+  if (n.includes('opus'))   return CLAUDE_PRICING.opus;
+  if (n.includes('sonnet')) return CLAUDE_PRICING.sonnet;
+  if (n.includes('haiku'))  return CLAUDE_PRICING.haiku;
+  return CLAUDE_PRICING.sonnet;
+}
+
+function computeCost(provider, modelName, input, cached, output, cacheWrite) {
+  const p = getModelPricing(provider, modelName);
+  return (input * p.input + cached * p.cached + output * p.output + (cacheWrite || 0) * p.cacheWrite) / M;
 }
 
 // ─── Formatting helpers ───────────────────────────────────
@@ -43,6 +63,12 @@ function fmtCost(n) {
   if (n == null || n === 0) return GRAY + '-' + RESET;
   if (n < 0.01) return '$' + n.toFixed(4);
   return '$' + n.toFixed(2);
+}
+
+function fmtRate(n) {
+  if (n == null || n === 0) return GRAY + '-' + RESET;
+  const decimals = (n.toString().split('.')[1] || '').length;
+  return '$' + n.toFixed(Math.max(2, decimals));
 }
 
 function shortModel(name) {
@@ -62,6 +88,45 @@ function padL(str, len) {
 function stripAnsi(s) {
   return s.replace(/\x1b\[[0-9;]*m/g, '');
 }
+
+// ─── Box-drawing and table helpers ───────────────────────
+
+const TL = '\u250c', TR = '\u2510', BL = '\u2514', BR = '\u2518';
+const HZ = '\u2500', VT = '\u2502', TT = '\u252c', TB = '\u2534', CR_ = '\u253c', LT = '\u251c', RT = '\u2524';
+const titleMap = { daily: 'Daily', monthly: 'Monthly' };
+
+function makeHLine(widths) {
+  return (left, mid, right) =>
+    GRAY + left + widths.map(w => HZ.repeat(w + 2)).join(mid) + right + RESET;
+}
+
+function makeRow(widths, leftAligned) {
+  return (...cells) =>
+    cells.map((c, i) => {
+      const pad = leftAligned.has(i) ? padR : padL;
+      return GRAY + VT + RESET + ' ' + pad(c, widths[i]) + ' ';
+    }).join('') + GRAY + VT + RESET;
+}
+
+function renderTitleBox(title, widths) {
+  const tableW = widths.reduce((s, w) => s + w + 3, 0) - 2;
+  const boxW = Math.max(tableW, title.length + 4);
+  const pad = Math.floor((boxW - title.length - 2) / 2);
+  console.log('');
+  console.log(CYAN + ' \u256d' + '\u2500'.repeat(boxW) + '\u256e' + RESET);
+  console.log(CYAN + ' \u2502' + ' '.repeat(pad) + BOLD + title + RESET + CYAN + ' '.repeat(boxW - pad - title.length) + '\u2502' + RESET);
+  console.log(CYAN + ' \u2570' + '\u2500'.repeat(boxW) + '\u256f' + RESET);
+  console.log('');
+}
+
+function renderLegend(extra) {
+  console.log('');
+  console.log('  ' + CYAN + '\u25cf' + RESET + ' Claude   ' + MAGENTA + '\u25cf' + RESET + ' OpenAI Codex');
+  if (extra) console.log('  ' + extra);
+  console.log('');
+}
+
+// ─── Date helpers ─────────────────────────────────────────
 
 function toISODate(ts) {
   const d = new Date(ts);
@@ -192,6 +257,7 @@ ${BOLD}COMMANDS:${RESET}
 ${BOLD}OPTIONS:${RESET}
   -s, --since <YYYYMMDD>   Filter from date
   -u, --until <YYYYMMDD>   Filter until date
+  -b, --breakdown          Show per-category cost breakdown with rates
   -h, --help               Show this help
 
 ${BOLD}COLUMNS:${RESET}
@@ -211,7 +277,7 @@ const subcommands = ['daily', 'monthly'];
 const passArgs = [...args];
 if (subcommands.includes(passArgs[0])) subcommand = passArgs.shift();
 
-let sinceDate = null, untilDate = null;
+let sinceDate = null, untilDate = null, showBreakdown = false;
 const claudePassArgs = [];
 for (let i = 0; i < passArgs.length; i++) {
   const a = passArgs[i];
@@ -223,6 +289,8 @@ for (let i = 0; i < passArgs.length; i++) {
     untilDate = parseFilterDate(passArgs[i + 1]);
     claudePassArgs.push(a, passArgs[i + 1]);
     i++;
+  } else if (a === '-b' || a === '--breakdown') {
+    showBreakdown = true;
   } else {
     claudePassArgs.push(a);
   }
@@ -243,7 +311,6 @@ if (!claudeData && codexByGroup.size === 0) {
 }
 
 // ─── Merge by date ────────────────────────────────────────
-// Each model entry: { model, input (non-cached), output, cacheWrite, cacheRead, total, cost, provider }
 
 const merged = new Map();
 
@@ -288,7 +355,7 @@ for (const [dateKey, models] of codexByGroup) {
   const bucket = merged.get(dateKey);
 
   for (const [modelName, m] of models) {
-    const cost = codexCost(modelName, m.input, m.cacheRead, m.output);
+    const cost = computeCost('codex', modelName, m.input, m.cacheRead, m.output, 0);
     bucket.dayTotal += cost;
     bucket.models.push({
       provider: 'codex',
@@ -309,60 +376,83 @@ if (sortedDates.length === 0) {
   process.exit(0);
 }
 
-// ─── Render table ─────────────────────────────────────────
-// Columns: Date | Model | Input | Output | Cache Wr | Cache Rd | Total | Cost
+// ─── Render cost breakdown ────────────────────────────────
 
-const COL = { date: 12, model: 20, input: 10, output: 10, cw: 10, cr: 12, total: 12, cost: 10 };
+if (showBreakdown) {
+  const cbW = [12, 20, 13, 16, 10, 12];
+  const hLineB = makeHLine(cbW);
+  const rowB = makeRow(cbW, new Set([0, 1, 2]));
 
-const TL = '\u250c', TR = '\u2510', BL = '\u2514', BR = '\u2518';
-const HZ = '\u2500', VT = '\u2502', TT = '\u252c', TB = '\u2534', CR_ = '\u253c', LT = '\u251c', RT = '\u2524';
+  renderTitleBox(`Cost Breakdown - ${titleMap[subcommand]}`, cbW);
 
-function hLine(left, mid, right) {
-  return GRAY + left
-    + HZ.repeat(COL.date + 2) + mid
-    + HZ.repeat(COL.model + 2) + mid
-    + HZ.repeat(COL.input + 2) + mid
-    + HZ.repeat(COL.output + 2) + mid
-    + HZ.repeat(COL.cw + 2) + mid
-    + HZ.repeat(COL.cr + 2) + mid
-    + HZ.repeat(COL.total + 2) + mid
-    + HZ.repeat(COL.cost + 2) + right + RESET;
+  console.log(hLineB(TL, TT, TR));
+  console.log(rowB(
+    CYAN + BOLD + 'Date' + RESET,
+    CYAN + BOLD + 'Model' + RESET,
+    CYAN + BOLD + 'Category' + RESET,
+    CYAN + BOLD + 'Tokens' + RESET,
+    CYAN + BOLD + '$/MTok' + RESET,
+    CYAN + BOLD + 'Cost' + RESET
+  ));
+  console.log(hLineB(LT, CR_, RT));
+
+  let gCostB = 0;
+
+  for (let di = 0; di < sortedDates.length; di++) {
+    const date = sortedDates[di];
+    const bucket = merged.get(date);
+    let dCostB = 0;
+    let firstModel = true;
+
+    for (let mi = 0; mi < bucket.models.length; mi++) {
+      const m = bucket.models[mi];
+      const pricing = getModelPricing(m.provider, m.model);
+      const marker = m.provider === 'claude' ? CYAN + '\u25cf' + RESET : MAGENTA + '\u25cf' + RESET;
+
+      const cats = [];
+      if (m.input > 0)      cats.push({ name: 'Input',      tokens: m.input,      rate: pricing.input,      cost: m.input * pricing.input / M });
+      if (m.output > 0)     cats.push({ name: 'Output',     tokens: m.output,     rate: pricing.output,     cost: m.output * pricing.output / M });
+      if (m.cacheWrite > 0) cats.push({ name: 'Cache Write', tokens: m.cacheWrite, rate: pricing.cacheWrite, cost: m.cacheWrite * pricing.cacheWrite / M });
+      if (m.cacheRead > 0)  cats.push({ name: 'Cache Read',  tokens: m.cacheRead,  rate: pricing.cached,     cost: m.cacheRead * pricing.cached / M });
+
+      if (cats.length === 0) continue;
+
+      const modelTotal = cats.reduce((s, c) => s + c.cost, 0);
+      dCostB += modelTotal;
+
+      for (let ci = 0; ci < cats.length; ci++) {
+        const c = cats[ci];
+        const dateStr = (firstModel && ci === 0) ? (BOLD + date + RESET) : '';
+        const modelStr = ci === 0 ? (marker + ' ' + m.model) : '';
+        console.log(rowB(dateStr, modelStr, c.name, fmt(c.tokens), fmtRate(c.rate), fmtCost(c.cost)));
+      }
+
+      console.log(rowB('', '', DIM + 'Subtotal' + RESET, '', '', BOLD + fmtCost(modelTotal) + RESET));
+      firstModel = false;
+    }
+
+    gCostB += dCostB;
+    console.log(rowB('', DIM + 'Day Total' + RESET, '', '', '', BOLD + YELLOW + fmtCost(dCostB) + RESET));
+
+    if (di < sortedDates.length - 1) console.log(hLineB(LT, CR_, RT));
+  }
+
+  console.log(hLineB(LT, CR_, RT));
+  console.log(rowB(BOLD + WHITE + 'Total' + RESET, '', '', '', '', BOLD + YELLOW + fmtCost(gCostB) + RESET));
+  console.log(hLineB(BL, TB, BR));
+
+  renderLegend('Rates: Claude estimated | Codex per openai.com');
+  process.exit(0);
 }
 
-function row(date, model, input, output, cw, cr, total, cost) {
-  return GRAY + VT + RESET + ' '
-    + padR(date, COL.date) + ' '
-    + GRAY + VT + RESET + ' '
-    + padR(model, COL.model) + ' '
-    + GRAY + VT + RESET + ' '
-    + padL(input, COL.input) + ' '
-    + GRAY + VT + RESET + ' '
-    + padL(output, COL.output) + ' '
-    + GRAY + VT + RESET + ' '
-    + padL(cw, COL.cw) + ' '
-    + GRAY + VT + RESET + ' '
-    + padL(cr, COL.cr) + ' '
-    + GRAY + VT + RESET + ' '
-    + padL(total, COL.total) + ' '
-    + GRAY + VT + RESET + ' '
-    + padL(cost, COL.cost) + ' '
-    + GRAY + VT + RESET;
-}
+// ─── Render standard table ───────────────────────────────
 
-// Title
-const titleMap = { daily: 'Daily', monthly: 'Monthly' };
-const title = `Unified Token Usage Report - ${titleMap[subcommand]}`;
-const TOTAL_W = COL.date + COL.model + COL.input + COL.output + COL.cw + COL.cr + COL.total + COL.cost + 10;
-const boxW = Math.max(TOTAL_W - 2, title.length + 4);
-const titlePad = Math.floor((boxW - title.length - 2) / 2);
+const colW = [12, 20, 14, 12, 12, 16, 16, 12];
+const hLine = makeHLine(colW);
+const row = makeRow(colW, new Set([0, 1]));
 
-console.log('');
-console.log(CYAN + ' \u256d' + '\u2500'.repeat(boxW) + '\u256e' + RESET);
-console.log(CYAN + ' \u2502' + ' '.repeat(titlePad) + BOLD + title + RESET + CYAN + ' '.repeat(boxW - titlePad - title.length) + '\u2502' + RESET);
-console.log(CYAN + ' \u2570' + '\u2500'.repeat(boxW) + '\u256f' + RESET);
-console.log('');
+renderTitleBox(`Unified Token Usage Report - ${titleMap[subcommand]}`, colW);
 
-// Header
 console.log(hLine(TL, TT, TR));
 console.log(row(
   CYAN + BOLD + 'Date' + RESET,
@@ -376,7 +466,6 @@ console.log(row(
 ));
 console.log(hLine(LT, CR_, RT));
 
-// Data rows
 let gInput = 0, gOutput = 0, gCW = 0, gCR = 0, gTotal = 0, gCost = 0;
 
 for (let di = 0; di < sortedDates.length; di++) {
@@ -406,7 +495,6 @@ for (let di = 0; di < sortedDates.length; di++) {
   gInput += dInput; gOutput += dOutput; gCW += dCW; gCR += dCR; gTotal += dTotal;
   gCost += bucket.dayTotal;
 
-  // Day total
   console.log(row(
     '', DIM + 'Day Total' + RESET,
     DIM + fmt(dInput) + RESET, DIM + fmt(dOutput) + RESET,
@@ -418,7 +506,6 @@ for (let di = 0; di < sortedDates.length; di++) {
   if (di < sortedDates.length - 1) console.log(hLine(LT, CR_, RT));
 }
 
-// Grand total
 console.log(hLine(LT, CR_, RT));
 console.log(row(
   BOLD + WHITE + 'Total' + RESET, '',
@@ -429,8 +516,4 @@ console.log(row(
 ));
 console.log(hLine(BL, TB, BR));
 
-// Legend
-console.log('');
-console.log('  ' + CYAN + '\u25cf' + RESET + ' Claude   ' + MAGENTA + '\u25cf' + RESET + ' OpenAI Codex');
-console.log('  Input = non-cached only | Cache Wr = Claude only (no cost for OpenAI)');
-console.log('');
+renderLegend('Input = non-cached only | Cache Wr = Claude only (no cost for OpenAI)');
