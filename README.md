@@ -62,11 +62,14 @@ Hardcoded pricing (updated Feb 2026):
 
 | Model | Input | Cached Input | Output |
 |-------|-------|-------------|--------|
-| gpt-5-codex | $1.25/MTok | $0.125/MTok | $10.00/MTok |
-| gpt-5.2-codex | $1.75/MTok | $0.175/MTok | $14.00/MTok |
-| gpt-5.3-codex | $1.75/MTok | $0.175/MTok | $14.00/MTok |
+| gpt-5-nano | $0.05/MTok | $0.005/MTok | $0.40/MTok |
+| gpt-5-mini | $0.25/MTok | $0.025/MTok | $2.00/MTok |
+| gpt-5 / gpt-5.1 / codex | $1.25/MTok | $0.125/MTok | $10.00/MTok |
+| gpt-5.2 / gpt-5.3 / codex | $1.75/MTok | $0.175/MTok | $14.00/MTok |
+| gpt-5-pro | $15.00/MTok | — | $120.00/MTok |
+| gpt-5.2-pro | $21.00/MTok | — | $168.00/MTok |
 
-Claude pricing is calculated by `ccusage` using LiteLLM data.
+Claude pricing: standard view uses `ccusage` (LiteLLM), `--breakdown` uses estimated rates.
 
 ## License
 

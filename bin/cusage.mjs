@@ -16,15 +16,34 @@ const YELLOW = '\x1b[33m';
 const WHITE = '\x1b[37m';
 const GRAY = '\x1b[90m';
 
-// ─── Pricing (per million tokens) ────────────────────────
+// ─── OpenAI pricing (per million tokens) ─────────────────
 // OpenAI has no cache write cost. Cache read = 10% of input price.
-const CODEX_PRICING = {
-  'gpt-5-codex':   { input: 1.25,  cached: 0.125,  output: 10.0 },
-  'gpt-5.1-codex': { input: 1.25,  cached: 0.125,  output: 10.0 },
-  'gpt-5.2-codex': { input: 1.75,  cached: 0.175,  output: 14.0 },
-  'gpt-5.3-codex': { input: 1.75,  cached: 0.175,  output: 14.0 },
+const OPENAI_PRICING = {
+  // Nano tier
+  'gpt-5-nano':          { input: 0.05,   cached: 0.005,   output: 0.40 },
+  // Mini tier
+  'gpt-5-mini':          { input: 0.25,   cached: 0.025,   output: 2.0 },
+  'gpt-5.1-codex-mini':  { input: 0.25,   cached: 0.025,   output: 2.0 },
+  // Standard tier (gpt-5 / gpt-5.1)
+  'gpt-5':               { input: 1.25,   cached: 0.125,   output: 10.0 },
+  'gpt-5-chat':          { input: 1.25,   cached: 0.125,   output: 10.0 },
+  'gpt-5-codex':         { input: 1.25,   cached: 0.125,   output: 10.0 },
+  'gpt-5.1':             { input: 1.25,   cached: 0.125,   output: 10.0 },
+  'gpt-5.1-chat':        { input: 1.25,   cached: 0.125,   output: 10.0 },
+  'gpt-5.1-codex':       { input: 1.25,   cached: 0.125,   output: 10.0 },
+  'gpt-5.1-codex-max':   { input: 1.25,   cached: 0.125,   output: 10.0 },
+  // Enhanced tier (gpt-5.2 / gpt-5.3)
+  'gpt-5.2':             { input: 1.75,   cached: 0.175,   output: 14.0 },
+  'gpt-5.2-chat':        { input: 1.75,   cached: 0.175,   output: 14.0 },
+  'gpt-5.2-codex':       { input: 1.75,   cached: 0.175,   output: 14.0 },
+  'gpt-5.3-codex':       { input: 1.75,   cached: 0.175,   output: 14.0 },
+  // Pro tier (no cache discount)
+  'gpt-5-pro':           { input: 15.0,   cached: 15.0,    output: 120.0 },
+  'gpt-5.2-pro':         { input: 21.0,   cached: 21.0,    output: 168.0 },
+  // Image tier
+  'gpt-5-image':         { input: 10.0,   cached: 1.25,    output: 10.0 },
+  'gpt-5-image-mini':    { input: 2.50,   cached: 0.25,    output: 2.0 },
 };
-const CODEX_FALLBACK = { input: 1.75, cached: 0.175, output: 14.0 };
 
 // Claude pricing estimated from model family (breakdown view only)
 const CLAUDE_PRICING = {
@@ -37,8 +56,16 @@ const M = 1_000_000;
 
 function getModelPricing(provider, modelName) {
   if (provider === 'codex') {
-    const p = CODEX_PRICING[modelName] || CODEX_FALLBACK;
-    return { input: p.input, cached: p.cached, output: p.output, cacheWrite: 0 };
+    const p = OPENAI_PRICING[modelName];
+    if (p) return { input: p.input, cached: p.cached, output: p.output, cacheWrite: 0 };
+    // Pattern fallback for unknown gpt-5 variants
+    const n = modelName.toLowerCase();
+    if (n.includes('nano'))             return { ...OPENAI_PRICING['gpt-5-nano'], cacheWrite: 0 };
+    if (n.includes('mini'))             return { ...OPENAI_PRICING['gpt-5-mini'], cacheWrite: 0 };
+    if (n.includes('pro') && n.includes('5.2')) return { ...OPENAI_PRICING['gpt-5.2-pro'], cacheWrite: 0 };
+    if (n.includes('pro'))              return { ...OPENAI_PRICING['gpt-5-pro'], cacheWrite: 0 };
+    if (n.includes('5.2') || n.includes('5.3')) return { ...OPENAI_PRICING['gpt-5.2'], cacheWrite: 0 };
+    return { ...OPENAI_PRICING['gpt-5'], cacheWrite: 0 };
   }
   const n = modelName.toLowerCase();
   if (n.includes('opus'))   return CLAUDE_PRICING.opus;
