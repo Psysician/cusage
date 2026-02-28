@@ -41,6 +41,10 @@ cusage --breakdown          # cost breakdown with per-token rates
 cusage --fast               # cached snapshot first (spawns background refresh)
 cusage --fresh              # force full refresh from source logs
 cusage --providers codex    # codex only
+cusage --providers openai   # alias for codex
+cusage --openai             # codex only (GPT models)
+cusage --claude             # claude only
+cusage --anthropic          # alias for claude only
 cusage --help               # show help
 ```
 

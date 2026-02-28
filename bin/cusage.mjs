@@ -176,6 +176,26 @@ function parseFilterDate(s) {
   return `${clean.slice(0, 4)}-${clean.slice(4, 6)}-${clean.slice(6, 8)}`;
 }
 
+function normalizeProviderName(name) {
+  const normalized = String(name || '').trim().toLowerCase();
+  if (normalized === 'openai') return 'codex';
+  if (normalized === 'anthropic') return 'claude';
+  return normalized;
+}
+
+function parseProviderSelection(value) {
+  const requested = new Set(
+    String(value || '')
+      .split(',')
+      .map((s) => normalizeProviderName(s))
+      .filter(Boolean),
+  );
+  return {
+    enableClaude: requested.has('claude'),
+    enableCodex: requested.has('codex'),
+  };
+}
+
 function isInteractiveSession(io = process) {
   return Boolean(io?.stdin?.isTTY && io?.stdout?.isTTY);
 }
@@ -568,7 +588,11 @@ ${BOLD}OPTIONS:${RESET}
   -b, --breakdown          Show per-category cost breakdown with rates
   --fast                   Prefer cached data for instant startup
   --fresh                  Force refresh from source logs
-  --providers <list>       Comma list: claude,codex
+  --providers <list>       Comma list: claude,codex (aliases: anthropic,openai)
+  --claude                 Claude only
+  --anthropic              Alias for --claude
+  --openai                 OpenAI Codex only
+  --codex                  Alias for --openai
   --no-claude              Disable Claude provider
   --no-codex               Disable Codex provider
   -h, --help               Show this help
@@ -618,12 +642,14 @@ for (let i = 0; i < passArgs.length; i++) {
   } else if (a === INTERNAL_BACKGROUND_FLAG) {
     backgroundRefresh = true;
   } else if (a === '--providers' && passArgs[i + 1]) {
-    const requested = new Set(
-      passArgs[i + 1].split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
-    );
-    enableClaude = requested.has('claude');
-    enableCodex = requested.has('codex');
+    ({ enableClaude, enableCodex } = parseProviderSelection(passArgs[i + 1]));
     i++;
+  } else if (a === '--claude' || a === '--anthropic') {
+    enableClaude = true;
+    enableCodex = false;
+  } else if (a === '--openai' || a === '--codex') {
+    enableClaude = false;
+    enableCodex = true;
   } else if (a === '--no-claude') {
     enableClaude = false;
   } else if (a === '--no-codex') {
@@ -636,7 +662,7 @@ for (let i = 0; i < passArgs.length; i++) {
 if (refreshCommand) freshMode = true;
 if (freshMode) fastMode = false;
 if (!enableClaude && !enableCodex) {
-  console.error('No providers enabled. Use --providers claude,codex or remove --no-* flags.');
+  console.error('No providers enabled. Use --providers claude,codex (or aliases anthropic,openai) or adjust provider flags.');
   process.exit(1);
 }
 
