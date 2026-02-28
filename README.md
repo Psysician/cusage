@@ -34,10 +34,32 @@ npx cusage
 ```bash
 cusage                      # daily report (default)
 cusage monthly              # monthly report
+cusage refresh              # force cache rebuild + render daily report
 cusage --since 20260220     # filter from date
 cusage --until 20260228     # filter until date
 cusage --breakdown          # cost breakdown with per-token rates
+cusage --fast               # cached snapshot first (spawns background refresh)
+cusage --fresh              # force full refresh from source logs
+cusage --providers codex    # codex only
 cusage --help               # show help
+```
+
+## Performance Modes
+
+- `--fresh`: bypasses cache and rebuilds from source logs
+- `--fast`: uses cached data immediately; if run interactively, starts a detached `--fresh` refresh in the background
+- default mode: validates cache and refreshes only when inputs changed
+
+Cache path defaults to:
+
+```bash
+~/.cache/cusage/cache-v2.json
+```
+
+Override with:
+
+```bash
+CUSAGE_CACHE_PATH=/some/path/cache.json cusage
 ```
 
 ## Columns
@@ -55,6 +77,7 @@ cusage --help               # show help
 
 - **Claude Code**: Delegates to `ccusage --json` (reads `~/.claude/projects/**/*.jsonl`)
 - **OpenAI Codex**: Reads `~/.codex/sessions/**/*.jsonl` directly, taking only the final cumulative `total_token_usage` per file
+  - Uses per-file index cache and a fast head/tail parser with full-parse fallback
 
 ## Pricing
 

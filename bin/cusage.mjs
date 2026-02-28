@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 
-import { execSync } from 'node:child_process';
-import { readFileSync, readdirSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { closeSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import process from 'node:process';
+const CACHE_VERSION = 2;
+const INTERNAL_BACKGROUND_FLAG = '--background-refresh';
 
 // ANSI colors
 const RESET = '\x1b[0m';
@@ -95,7 +97,7 @@ function fmtCost(n) {
 function fmtRate(n) {
   if (n == null || n === 0) return GRAY + '-' + RESET;
   const decimals = (n.toString().split('.')[1] || '').length;
-  return '$' + n.toFixed(Math.max(2, decimals));
+  return '$' + n.toFixed(Math.min(4, Math.max(2, decimals)));
 }
 
 function shortModel(name) {
@@ -174,6 +176,93 @@ function parseFilterDate(s) {
   return `${clean.slice(0, 4)}-${clean.slice(4, 6)}-${clean.slice(6, 8)}`;
 }
 
+function isInteractiveSession(io = process) {
+  return Boolean(io?.stdin?.isTTY && io?.stdout?.isTTY);
+}
+
+function shouldSpawnBackgroundRefresh({
+  fastMode,
+  freshMode,
+  backgroundRefresh,
+  interactiveSession,
+}) {
+  return fastMode && !freshMode && !backgroundRefresh && interactiveSession;
+}
+
+function resolveCachePath() {
+  const custom = process.env.CUSAGE_CACHE_PATH?.trim();
+  if (custom) return custom;
+  return join(homedir(), '.cache', 'cusage', `cache-v${CACHE_VERSION}.json`);
+}
+
+function createEmptyCache() {
+  return {
+    version: CACHE_VERSION,
+    claude: { commands: {} },
+    codex: { files: {} },
+  };
+}
+
+function normalizeCache(raw) {
+  if (!raw || typeof raw !== 'object') return createEmptyCache();
+  const cache = raw;
+  if (cache.version !== CACHE_VERSION) return createEmptyCache();
+  if (!cache.claude || typeof cache.claude !== 'object') cache.claude = { commands: {} };
+  if (!cache.codex || typeof cache.codex !== 'object') cache.codex = { files: {} };
+  if (!cache.claude.commands || typeof cache.claude.commands !== 'object') cache.claude.commands = {};
+  if (!cache.codex.files || typeof cache.codex.files !== 'object') cache.codex.files = {};
+  return cache;
+}
+
+function loadCache(cachePath) {
+  try {
+    const raw = JSON.parse(readFileSync(cachePath, 'utf-8'));
+    return normalizeCache(raw);
+  } catch {
+    return createEmptyCache();
+  }
+}
+
+function saveCache(cachePath, cache) {
+  try {
+    mkdirSync(dirname(cachePath), { recursive: true });
+    writeFileSync(cachePath, JSON.stringify(cache), 'utf-8');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const MASK64 = 0xffffffffffffffffn;
+const FNV_PRIME = 1099511628211n;
+function fnvMix(hash, value) {
+  return ((hash ^ (BigInt(value) & MASK64)) * FNV_PRIME) & MASK64;
+}
+
+function computeJsonlFingerprint(dir) {
+  const files = findJsonlFiles(dir).sort();
+  let hash = 1469598103934665603n;
+  let totalSize = 0n;
+  let newestMtime = 0;
+  let seen = 0;
+
+  for (const file of files) {
+    let st;
+    try { st = statSync(file); } catch { continue; }
+    seen++;
+    const size = BigInt(st.size);
+    const mtime = Math.trunc(st.mtimeMs);
+    totalSize += size;
+    if (mtime > newestMtime) newestMtime = mtime;
+
+    for (let i = 0; i < file.length; i++) hash = fnvMix(hash, file.charCodeAt(i));
+    hash = fnvMix(hash, size);
+    hash = fnvMix(hash, mtime);
+  }
+
+  return `${seen}:${totalSize.toString()}:${newestMtime}:${hash.toString(16)}`;
+}
+
 // ─── Direct Codex JSONL reader (fixes upstream double-counting) ─
 
 function findJsonlFiles(dir) {
@@ -189,67 +278,178 @@ function findJsonlFiles(dir) {
   return results;
 }
 
-function loadCodexDirect(sinceDate, untilDate, groupMode) {
+function createCodexState() {
+  return {
+    sessionTimestamp: null,
+    model: null,
+    lastTotal: null,
+  };
+}
+
+function applyCodexObjectToState(obj, state) {
+  if (!obj || typeof obj !== 'object') return;
+
+  if (obj.type === 'session_meta' && obj.payload?.timestamp) state.sessionTimestamp = obj.payload.timestamp;
+  if (obj.type === 'turn_context' && obj.payload?.model) state.model = obj.payload.model;
+
+  if (obj.type === 'event_msg' && obj.payload?.type === 'token_count') {
+    const info = obj.payload?.info;
+    if (info?.model) state.model = info.model;
+    if (info?.metadata?.model) state.model = info.metadata.model;
+    if (info?.total_token_usage) state.lastTotal = info.total_token_usage;
+  }
+
+  if (!state.sessionTimestamp && obj.timestamp) state.sessionTimestamp = obj.timestamp;
+}
+
+function applyJsonlTextToState(text, state, dropFirstLine = false) {
+  const lines = text.split(/\r?\n/);
+  const start = dropFirstLine ? 1 : 0;
+  for (let i = start; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line || !line.trim()) continue;
+    let obj;
+    try { obj = JSON.parse(line); } catch { continue; }
+    applyCodexObjectToState(obj, state);
+  }
+}
+
+function summarizeCodexState(state) {
+  const lastTotal = state.lastTotal;
+  if (!lastTotal || !state.sessionTimestamp) return null;
+
+  const model = state.model || 'codex-unknown';
+  const inputTotal = lastTotal.input_tokens || 0;
+  const cached = lastTotal.cached_input_tokens || lastTotal.cache_read_input_tokens || 0;
+  const nonCachedInput = Math.max(inputTotal - cached, 0);
+  const output = lastTotal.output_tokens || 0;
+  const reasoning = lastTotal.reasoning_output_tokens || 0;
+  const total = lastTotal.total_tokens || (inputTotal + output);
+
+  return {
+    sessionTimestamp: state.sessionTimestamp,
+    model,
+    input: nonCachedInput,
+    cacheRead: cached,
+    output,
+    reasoning,
+    total,
+  };
+}
+
+function parseCodexSummaryFull(file) {
+  let content;
+  try { content = readFileSync(file, 'utf-8'); } catch { return null; }
+  const state = createCodexState();
+  applyJsonlTextToState(content, state, false);
+  return summarizeCodexState(state);
+}
+
+function readTextRange(file, start, length) {
+  let fd;
+  try {
+    fd = openSync(file, 'r');
+    const buf = Buffer.alloc(length);
+    const bytes = readSync(fd, buf, 0, length, start);
+    return buf.subarray(0, bytes).toString('utf-8');
+  } catch {
+    return '';
+  } finally {
+    if (fd != null) {
+      try { closeSync(fd); } catch { /* noop */ }
+    }
+  }
+}
+
+function parseCodexSummaryFast(file, size) {
+  if (size <= 0) return null;
+  const headLen = Math.min(size, 128 * 1024);
+  const tailLen = Math.min(size, 256 * 1024);
+  const tailStart = Math.max(0, size - tailLen);
+
+  const state = createCodexState();
+  const headText = readTextRange(file, 0, headLen);
+  if (headText) applyJsonlTextToState(headText, state, false);
+
+  const tailText = readTextRange(file, tailStart, tailLen);
+  if (tailText) applyJsonlTextToState(tailText, state, tailStart > 0);
+
+  return summarizeCodexState(state);
+}
+
+function inDateRange(groupMode, dateKey, sinceDate, untilDate) {
+  if (groupMode === 'monthly') {
+    const sinceMonth = sinceDate ? sinceDate.slice(0, 7) : null;
+    const untilMonth = untilDate ? untilDate.slice(0, 7) : null;
+    if (sinceMonth && dateKey < sinceMonth) return false;
+    if (untilMonth && dateKey > untilMonth) return false;
+    return true;
+  }
+  if (sinceDate && dateKey < sinceDate) return false;
+  if (untilDate && dateKey > untilDate) return false;
+  return true;
+}
+
+function pushCodexSummary(byGroup, summary, groupMode, sinceDate, untilDate) {
+  const dateKey = groupMode === 'monthly' ? toMonthKey(summary.sessionTimestamp) : toISODate(summary.sessionTimestamp);
+  if (!dateKey) return;
+  if (!inDateRange(groupMode, dateKey, sinceDate, untilDate)) return;
+
+  if (!byGroup.has(dateKey)) byGroup.set(dateKey, new Map());
+  const models = byGroup.get(dateKey);
+  if (!models.has(summary.model)) {
+    models.set(summary.model, { input: 0, cacheWrite: 0, cacheRead: 0, output: 0, reasoning: 0, total: 0 });
+  }
+  const m = models.get(summary.model);
+  m.input += summary.input;
+  m.cacheRead += summary.cacheRead;
+  m.output += summary.output;
+  m.reasoning += summary.reasoning;
+  m.total += summary.total;
+}
+
+function loadCodexDirect(sinceDate, untilDate, groupMode, options = {}) {
   const codexHome = process.env.CODEX_HOME?.trim() || join(homedir(), '.codex');
   const sessionsDir = join(codexHome, 'sessions');
   const files = findJsonlFiles(sessionsDir);
   const byGroup = new Map();
 
+  const cacheFiles = options.cache?.codex?.files ?? {};
+  const fresh = options.fresh === true;
+  const fast = options.fast === true;
+  const seen = new Set();
+
   for (const file of files) {
-    let content;
-    try { content = readFileSync(file, 'utf-8'); } catch { continue; }
+    seen.add(file);
+    let st;
+    try { st = statSync(file); } catch { continue; }
 
-    const lines = content.split(/\r?\n/).filter(l => l.trim());
-    if (lines.length === 0) continue;
+    const mtimeMs = Math.trunc(st.mtimeMs);
+    const size = st.size;
+    const cached = cacheFiles[file];
 
-    let sessionTimestamp = null;
-    let model = null;
-    let lastTotal = null;
-
-    for (const line of lines) {
-      let obj;
-      try { obj = JSON.parse(line); } catch { continue; }
-
-      if (obj.type === 'session_meta' && obj.payload?.timestamp) sessionTimestamp = obj.payload.timestamp;
-      if (obj.type === 'turn_context' && obj.payload?.model) model = obj.payload.model;
-
-      if (obj.type === 'event_msg' && obj.payload?.type === 'token_count') {
-        const info = obj.payload?.info;
-        if (info?.model) model = info.model;
-        if (info?.metadata?.model) model = info.metadata.model;
-        if (info?.total_token_usage) lastTotal = info.total_token_usage;
+    let summary = null;
+    if (!fresh && cached && cached.mtimeMs === mtimeMs && cached.size === size) {
+      summary = cached.summary ?? null;
+    } else {
+      summary = parseCodexSummaryFast(file, size);
+      if (!summary) summary = parseCodexSummaryFull(file);
+      if (!summary && fast && !fresh && cached?.summary) summary = cached.summary;
+      if (summary) {
+        cacheFiles[file] = { mtimeMs, size, summary };
+        options.cacheDirty = true;
       }
-
-      if (!sessionTimestamp && obj.timestamp) sessionTimestamp = obj.timestamp;
     }
 
-    if (!lastTotal || !sessionTimestamp) continue;
-    if (!model) model = 'codex-unknown';
+    if (!summary) continue;
+    pushCodexSummary(byGroup, summary, groupMode, sinceDate, untilDate);
+  }
 
-    const dateKey = groupMode === 'monthly' ? toMonthKey(sessionTimestamp) : toISODate(sessionTimestamp);
-    if (!dateKey) continue;
-    if (sinceDate && dateKey < sinceDate) continue;
-    if (untilDate && dateKey > untilDate) continue;
-
-    if (!byGroup.has(dateKey)) byGroup.set(dateKey, new Map());
-    const models = byGroup.get(dateKey);
-
-    const inputTotal = lastTotal.input_tokens || 0;
-    const cached = lastTotal.cached_input_tokens || lastTotal.cache_read_input_tokens || 0;
-    const nonCachedInput = Math.max(inputTotal - cached, 0);
-    const output = lastTotal.output_tokens || 0;
-    const reasoning = lastTotal.reasoning_output_tokens || 0;
-    const total = lastTotal.total_tokens || (inputTotal + output);
-
-    if (!models.has(model)) {
-      models.set(model, { input: 0, cacheWrite: 0, cacheRead: 0, output: 0, reasoning: 0, total: 0 });
+  for (const file of Object.keys(cacheFiles)) {
+    if (!seen.has(file)) {
+      delete cacheFiles[file];
+      options.cacheDirty = true;
     }
-    const m = models.get(model);
-    m.input += nonCachedInput;
-    m.cacheRead += cached;
-    m.output += output;
-    m.reasoning += reasoning;
-    m.total += total;
   }
 
   return byGroup;
@@ -257,13 +457,93 @@ function loadCodexDirect(sinceDate, untilDate, groupMode) {
 
 // ─── Claude data via ccusage --json ───────────────────────
 
-function runTool(cmd) {
-  try {
-    const out = execSync(cmd, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 60000 });
-    return JSON.parse(out);
-  } catch {
-    return null;
+async function runToolAsync(command, args) {
+  return await new Promise((resolve) => {
+    let finished = false;
+    const tmpFile = join(
+      process.env.TMPDIR || '/tmp',
+      `cusage-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`,
+    );
+    let outFd;
+    try {
+      outFd = openSync(tmpFile, 'w');
+    } catch {
+      resolve(null);
+      return;
+    }
+
+    const child = spawn(command, args, {
+      stdio: ['ignore', outFd, 'ignore'],
+    });
+
+    const done = (value) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timeout);
+      try { closeSync(outFd); } catch { /* noop */ }
+      try { unlinkSync(tmpFile); } catch { /* noop */ }
+      resolve(value);
+    };
+
+    const timeout = setTimeout(() => {
+      if (finished) return;
+      child.kill('SIGTERM');
+    }, 60000);
+
+    child.on('error', () => {
+      done(null);
+    });
+
+    child.on('close', (code) => {
+      if (code !== 0) return done(null);
+      try {
+        const raw = readFileSync(tmpFile, 'utf-8');
+        done(JSON.parse(raw));
+      } catch {
+        done(null);
+      }
+    });
+  });
+}
+
+function buildClaudeCacheKey(subcommand, claudeArgs) {
+  return `${subcommand}::${claudeArgs.join('\x1f')}`;
+}
+
+async function loadClaudeData(subcommand, claudeArgs, options) {
+  const claudeHome = process.env.CLAUDE_HOME?.trim() || join(homedir(), '.claude');
+  const projectsDir = join(claudeHome, 'projects');
+  const key = buildClaudeCacheKey(subcommand, claudeArgs);
+  const commands = options.cache.claude.commands;
+  const cached = commands[key];
+
+  if (options.fast && !options.fresh && cached?.data) {
+    return { data: cached.data, source: 'cache-stale' };
   }
+  if (options.fast && !options.fresh && !cached?.data) {
+    return { data: null, source: 'cache-miss' };
+  }
+
+  const fingerprint = computeJsonlFingerprint(projectsDir);
+
+  if (!options.fresh && cached?.data && cached.fingerprint === fingerprint) {
+    return { data: cached.data, source: 'cache' };
+  }
+
+  const live = await runToolAsync('ccusage', [subcommand, '--json', ...claudeArgs]);
+
+  if (live) {
+    commands[key] = {
+      fingerprint,
+      updatedAt: new Date().toISOString(),
+      data: live,
+    };
+    options.cacheDirty = true;
+    return { data: live, source: 'live' };
+  }
+
+  if (cached?.data) return { data: cached.data, source: 'cache-fallback' };
+  return { data: null, source: 'none' };
 }
 
 // ─── Main ─────────────────────────────────────────────────
@@ -275,16 +555,22 @@ if (args.includes('--help') || args.includes('-h')) {
 ${BOLD}cusage${RESET} — Unified AI usage report: Claude Code + OpenAI Codex in one table
 
 ${BOLD}USAGE:${RESET}
-  cusage [daily|monthly] [OPTIONS]
+  cusage [daily|monthly|refresh] [OPTIONS]
 
 ${BOLD}COMMANDS:${RESET}
   daily     Show merged report grouped by date (default)
   monthly   Show merged report grouped by month
+  refresh   Rebuild caches, then print daily report
 
 ${BOLD}OPTIONS:${RESET}
   -s, --since <YYYYMMDD>   Filter from date
   -u, --until <YYYYMMDD>   Filter until date
   -b, --breakdown          Show per-category cost breakdown with rates
+  --fast                   Prefer cached data for instant startup
+  --fresh                  Force refresh from source logs
+  --providers <list>       Comma list: claude,codex
+  --no-claude              Disable Claude provider
+  --no-codex               Disable Codex provider
   -h, --help               Show this help
 
 ${BOLD}COLUMNS:${RESET}
@@ -300,11 +586,18 @@ ${BOLD}COLUMNS:${RESET}
 
 // Parse args
 let subcommand = 'daily';
-const subcommands = ['daily', 'monthly'];
+let refreshCommand = false;
+const subcommands = ['daily', 'monthly', 'refresh'];
 const passArgs = [...args];
 if (subcommands.includes(passArgs[0])) subcommand = passArgs.shift();
+if (subcommand === 'refresh') {
+  refreshCommand = true;
+  subcommand = 'daily';
+}
 
 let sinceDate = null, untilDate = null, showBreakdown = false;
+let fastMode = false, freshMode = false, backgroundRefresh = false;
+let enableClaude = true, enableCodex = true;
 const claudePassArgs = [];
 for (let i = 0; i < passArgs.length; i++) {
   const a = passArgs[i];
@@ -318,19 +611,81 @@ for (let i = 0; i < passArgs.length; i++) {
     i++;
   } else if (a === '-b' || a === '--breakdown') {
     showBreakdown = true;
+  } else if (a === '--fast') {
+    fastMode = true;
+  } else if (a === '--fresh') {
+    freshMode = true;
+  } else if (a === INTERNAL_BACKGROUND_FLAG) {
+    backgroundRefresh = true;
+  } else if (a === '--providers' && passArgs[i + 1]) {
+    const requested = new Set(
+      passArgs[i + 1].split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
+    );
+    enableClaude = requested.has('claude');
+    enableCodex = requested.has('codex');
+    i++;
+  } else if (a === '--no-claude') {
+    enableClaude = false;
+  } else if (a === '--no-codex') {
+    enableCodex = false;
   } else {
     claudePassArgs.push(a);
   }
 }
 
-const claudeArgStr = claudePassArgs.map(a => `'${a}'`).join(' ');
+if (refreshCommand) freshMode = true;
+if (freshMode) fastMode = false;
+if (!enableClaude && !enableCodex) {
+  console.error('No providers enabled. Use --providers claude,codex or remove --no-* flags.');
+  process.exit(1);
+}
+
+const hasOfflineOverride = claudePassArgs.includes('-O')
+  || claudePassArgs.includes('--offline')
+  || claudePassArgs.includes('--no-offline');
+if (enableClaude && !hasOfflineOverride) claudePassArgs.push('--offline');
 const groupKey = subcommand === 'monthly' ? 'monthly' : 'daily';
 
-process.stderr.write(`${DIM}Loading data...${RESET}\n`);
+if (fastMode && !backgroundRefresh) process.stderr.write(`${DIM}Loading data from cache-first mode...${RESET}\n`);
+else process.stderr.write(`${DIM}Loading data...${RESET}\n`);
 
-const claudeCmd = `ccusage ${subcommand} --json ${claudeArgStr}`.trim();
-const claudeData = runTool(claudeCmd);
-const codexByGroup = loadCodexDirect(sinceDate, untilDate, subcommand === 'monthly' ? 'monthly' : 'daily');
+const interactiveSession = isInteractiveSession();
+
+if (shouldSpawnBackgroundRefresh({ fastMode, freshMode, backgroundRefresh, interactiveSession })) {
+  const bgArgs = args.filter((a) => a !== '--fast' && a !== INTERNAL_BACKGROUND_FLAG);
+  if (!bgArgs.includes('--fresh')) bgArgs.push('--fresh');
+  bgArgs.push(INTERNAL_BACKGROUND_FLAG);
+  try {
+    const child = spawn(process.argv[0], [process.argv[1], ...bgArgs], { detached: true, stdio: 'ignore' });
+    child.unref();
+  } catch {
+    // Background refresh is best-effort only.
+  }
+}
+
+const cachePath = resolveCachePath();
+const cache = loadCache(cachePath);
+const loaderState = {
+  cache,
+  cacheDirty: false,
+  fresh: freshMode,
+  fast: fastMode,
+};
+
+const claudePromise = enableClaude
+  ? loadClaudeData(subcommand, claudePassArgs, loaderState)
+  : Promise.resolve({ data: null, source: 'disabled' });
+
+const codexByGroup = enableCodex
+  ? loadCodexDirect(sinceDate, untilDate, subcommand === 'monthly' ? 'monthly' : 'daily', loaderState)
+  : new Map();
+
+const { data: claudeData, source: claudeSource } = await claudePromise;
+
+if (loaderState.cacheDirty) saveCache(cachePath, cache);
+if (claudeSource === 'cache-stale') process.stderr.write(`${DIM}Using stale Claude cache (--fast).${RESET}\n`);
+if (claudeSource === 'cache-fallback') process.stderr.write(`${DIM}Claude refresh failed; using cached data.${RESET}\n`);
+if (claudeSource === 'cache-miss') process.stderr.write(`${DIM}No Claude cache yet (run with --fresh once).${RESET}\n`);
 
 if (!claudeData && codexByGroup.size === 0) {
   console.error('No data from either source.');
@@ -343,7 +698,8 @@ const merged = new Map();
 
 if (claudeData?.[groupKey]) {
   for (const entry of claudeData[groupKey]) {
-    const date = entry.date;
+    const date = entry.date || entry.month;
+    if (!date) continue;
     if (!merged.has(date)) merged.set(date, { models: [], dayTotal: 0 });
     const bucket = merged.get(date);
     bucket.dayTotal += entry.totalCost || 0;
@@ -444,7 +800,19 @@ if (showBreakdown) {
 
       if (cats.length === 0) continue;
 
-      const modelTotal = cats.reduce((s, c) => s + c.cost, 0);
+      let modelTotal = cats.reduce((s, c) => s + c.cost, 0);
+
+      // Claude category pricing varies in practice; align category totals to ccusage's model cost
+      // so breakdown subtotals remain consistent with the standard report.
+      if (m.provider === 'claude' && Number.isFinite(m.cost) && m.cost > 0 && modelTotal > 0) {
+        const scale = m.cost / modelTotal;
+        for (const c of cats) {
+          c.cost *= scale;
+          c.rate = c.tokens > 0 ? (c.cost * M) / c.tokens : c.rate;
+        }
+        modelTotal = m.cost;
+      }
+
       dCostB += modelTotal;
 
       for (let ci = 0; ci < cats.length; ci++) {
@@ -468,7 +836,7 @@ if (showBreakdown) {
   console.log(rowB(BOLD + WHITE + 'Total' + RESET, '', '', '', '', BOLD + YELLOW + fmtCost(gCostB) + RESET));
   console.log(hLineB(BL, TB, BR));
 
-  renderLegend('Rates: Claude estimated | Codex per openai.com');
+  renderLegend('Rates: Claude effective (scaled to ccusage model totals) | Codex per openai.com');
   process.exit(0);
 }
 
