@@ -5,8 +5,9 @@ import { closeSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, st
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import process from 'node:process';
-const CACHE_VERSION = 2;
+const CACHE_VERSION = 3;
 const INTERNAL_BACKGROUND_FLAG = '--background-refresh';
+const SERVICE_TIER_SUPPORTED_FROM = '2026-03-06';
 
 // ANSI colors
 const RESET = '\x1b[0m';
@@ -39,6 +40,10 @@ const OPENAI_PRICING = {
   'gpt-5.2-chat':        { input: 1.75,   cached: 0.175,   output: 14.0 },
   'gpt-5.2-codex':       { input: 1.75,   cached: 0.175,   output: 14.0 },
   'gpt-5.3-codex':       { input: 1.75,   cached: 0.175,   output: 14.0 },
+  // GPT-5.4 tier
+  'gpt-5.4':             { input: 2.50,   cached: 0.25,    output: 15.0 },
+  'gpt-5.4-chat':        { input: 2.50,   cached: 0.25,    output: 15.0 },
+  'gpt-5.4-codex':       { input: 2.50,   cached: 0.25,    output: 15.0 },
   // Pro tier (no cache discount)
   'gpt-5-pro':           { input: 15.0,   cached: 15.0,    output: 120.0 },
   'gpt-5.2-pro':         { input: 21.0,   cached: 21.0,    output: 168.0 },
@@ -54,20 +59,55 @@ const CLAUDE_PRICING = {
   haiku:  { input: 0.80,  cached: 0.08,  output: 4.0,   cacheWrite: 1.0 },
 };
 
+const OPENAI_SERVICE_TIER_MULTIPLIERS = {
+  standard: 1,
+  priority: 2,
+  flex: 0.5,
+};
+
 const M = 1_000_000;
 
-function getModelPricing(provider, modelName) {
+function normalizeServiceTier(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized === 'fast') return 'priority';
+  if (normalized === 'standard' || normalized === 'priority' || normalized === 'flex') return normalized;
+  return null;
+}
+
+function parseServiceTierSelection(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized === 'auto') return 'auto';
+  return normalizeServiceTier(normalized);
+}
+
+function getBaseOpenAIPricing(modelName) {
+  const p = OPENAI_PRICING[modelName];
+  if (p) return p;
+
+  // Pattern fallback for unknown gpt-5 variants
+  const n = modelName.toLowerCase();
+  if (n.includes('nano')) return OPENAI_PRICING['gpt-5-nano'];
+  if (n.includes('mini')) return OPENAI_PRICING['gpt-5-mini'];
+  if (n.includes('pro') && n.includes('5.2')) return OPENAI_PRICING['gpt-5.2-pro'];
+  if (n.includes('pro')) return OPENAI_PRICING['gpt-5-pro'];
+  if (n.includes('5.4')) return OPENAI_PRICING['gpt-5.4'];
+  if (n.includes('5.2') || n.includes('5.3')) return OPENAI_PRICING['gpt-5.2'];
+  return OPENAI_PRICING['gpt-5'];
+}
+
+function getModelPricing(provider, modelName, serviceTier = 'standard') {
   if (provider === 'codex') {
-    const p = OPENAI_PRICING[modelName];
-    if (p) return { input: p.input, cached: p.cached, output: p.output, cacheWrite: 0 };
-    // Pattern fallback for unknown gpt-5 variants
-    const n = modelName.toLowerCase();
-    if (n.includes('nano'))             return { ...OPENAI_PRICING['gpt-5-nano'], cacheWrite: 0 };
-    if (n.includes('mini'))             return { ...OPENAI_PRICING['gpt-5-mini'], cacheWrite: 0 };
-    if (n.includes('pro') && n.includes('5.2')) return { ...OPENAI_PRICING['gpt-5.2-pro'], cacheWrite: 0 };
-    if (n.includes('pro'))              return { ...OPENAI_PRICING['gpt-5-pro'], cacheWrite: 0 };
-    if (n.includes('5.2') || n.includes('5.3')) return { ...OPENAI_PRICING['gpt-5.2'], cacheWrite: 0 };
-    return { ...OPENAI_PRICING['gpt-5'], cacheWrite: 0 };
+    const p = getBaseOpenAIPricing(modelName);
+    const tier = normalizeServiceTier(serviceTier) || 'standard';
+    const multiplier = OPENAI_SERVICE_TIER_MULTIPLIERS[tier] ?? 1;
+    return {
+      input: p.input * multiplier,
+      cached: p.cached * multiplier,
+      output: p.output * multiplier,
+      cacheWrite: 0,
+    };
   }
   const n = modelName.toLowerCase();
   if (n.includes('opus'))   return CLAUDE_PRICING.opus;
@@ -76,8 +116,8 @@ function getModelPricing(provider, modelName) {
   return CLAUDE_PRICING.sonnet;
 }
 
-function computeCost(provider, modelName, input, cached, output, cacheWrite) {
-  const p = getModelPricing(provider, modelName);
+function computeCost(provider, modelName, input, cached, output, cacheWrite, serviceTier = 'standard') {
+  const p = getModelPricing(provider, modelName, serviceTier);
   return (input * p.input + cached * p.cached + output * p.output + (cacheWrite || 0) * p.cacheWrite) / M;
 }
 
@@ -196,6 +236,66 @@ function parseProviderSelection(value) {
   };
 }
 
+function isFallbackServiceTierAvailable(sessionTimestamp) {
+  const dateKey = toISODate(sessionTimestamp);
+  return Boolean(dateKey && dateKey >= SERVICE_TIER_SUPPORTED_FROM);
+}
+
+function readCodexConfigServiceTier() {
+  const codexHome = process.env.CODEX_HOME?.trim() || join(homedir(), '.codex');
+  const configPath = join(codexHome, 'config.toml');
+
+  try {
+    const raw = readFileSync(configPath, 'utf-8');
+    const match = raw.match(/^\s*service_tier\s*=\s*"([^"]+)"/m);
+    return normalizeServiceTier(match?.[1]);
+  } catch {
+    return null;
+  }
+}
+
+function extractCodexServiceTier(obj) {
+  const payload = obj?.payload;
+  const candidates = [
+    obj?.service_tier,
+    obj?.serviceTier,
+    payload?.service_tier,
+    payload?.serviceTier,
+    payload?.info?.service_tier,
+    payload?.info?.serviceTier,
+    payload?.info?.metadata?.service_tier,
+    payload?.info?.metadata?.serviceTier,
+    payload?.metadata?.service_tier,
+    payload?.metadata?.serviceTier,
+  ];
+
+  for (const candidate of candidates) {
+    const normalized = normalizeServiceTier(candidate);
+    if (normalized) return normalized;
+  }
+  return null;
+}
+
+function resolveCodexServiceTier(summary, options = {}) {
+  const exact = normalizeServiceTier(summary?.serviceTier);
+  if (exact) return exact;
+
+  const override = options.serviceTierOverride && options.serviceTierOverride !== 'auto'
+    ? normalizeServiceTier(options.serviceTierOverride)
+    : null;
+  if (override) return override;
+
+  if (!isFallbackServiceTierAvailable(summary?.sessionTimestamp)) return 'standard';
+
+  return normalizeServiceTier(options.defaultServiceTier) || 'standard';
+}
+
+function formatCodexModelLabel(modelName, serviceTier) {
+  return serviceTier && serviceTier !== 'standard'
+    ? `${modelName} (${serviceTier})`
+    : modelName;
+}
+
 function isInteractiveSession(io = process) {
   return Boolean(io?.stdin?.isTTY && io?.stdout?.isTTY);
 }
@@ -302,6 +402,7 @@ function createCodexState() {
   return {
     sessionTimestamp: null,
     model: null,
+    serviceTier: null,
     lastTotal: null,
   };
 }
@@ -318,6 +419,9 @@ function applyCodexObjectToState(obj, state) {
     if (info?.metadata?.model) state.model = info.metadata.model;
     if (info?.total_token_usage) state.lastTotal = info.total_token_usage;
   }
+
+  const serviceTier = extractCodexServiceTier(obj);
+  if (serviceTier) state.serviceTier = serviceTier;
 
   if (!state.sessionTimestamp && obj.timestamp) state.sessionTimestamp = obj.timestamp;
 }
@@ -349,6 +453,7 @@ function summarizeCodexState(state) {
   return {
     sessionTimestamp: state.sessionTimestamp,
     model,
+    serviceTier: state.serviceTier,
     input: nonCachedInput,
     cacheRead: cached,
     output,
@@ -410,17 +515,29 @@ function inDateRange(groupMode, dateKey, sinceDate, untilDate) {
   return true;
 }
 
-function pushCodexSummary(byGroup, summary, groupMode, sinceDate, untilDate) {
+function pushCodexSummary(byGroup, summary, groupMode, sinceDate, untilDate, options = {}) {
   const dateKey = groupMode === 'monthly' ? toMonthKey(summary.sessionTimestamp) : toISODate(summary.sessionTimestamp);
   if (!dateKey) return;
   if (!inDateRange(groupMode, dateKey, sinceDate, untilDate)) return;
 
+  const serviceTier = resolveCodexServiceTier(summary, options);
+  const modelKey = `${summary.model}\x1f${serviceTier}`;
+
   if (!byGroup.has(dateKey)) byGroup.set(dateKey, new Map());
   const models = byGroup.get(dateKey);
-  if (!models.has(summary.model)) {
-    models.set(summary.model, { input: 0, cacheWrite: 0, cacheRead: 0, output: 0, reasoning: 0, total: 0 });
+  if (!models.has(modelKey)) {
+    models.set(modelKey, {
+      model: summary.model,
+      serviceTier,
+      input: 0,
+      cacheWrite: 0,
+      cacheRead: 0,
+      output: 0,
+      reasoning: 0,
+      total: 0,
+    });
   }
-  const m = models.get(summary.model);
+  const m = models.get(modelKey);
   m.input += summary.input;
   m.cacheRead += summary.cacheRead;
   m.output += summary.output;
@@ -462,7 +579,7 @@ function loadCodexDirect(sinceDate, untilDate, groupMode, options = {}) {
     }
 
     if (!summary) continue;
-    pushCodexSummary(byGroup, summary, groupMode, sinceDate, untilDate);
+    pushCodexSummary(byGroup, summary, groupMode, sinceDate, untilDate, options);
   }
 
   for (const file of Object.keys(cacheFiles)) {
@@ -588,6 +705,7 @@ ${BOLD}OPTIONS:${RESET}
   -b, --breakdown          Show per-category cost breakdown with rates
   --fast                   Prefer cached data for instant startup
   --fresh                  Force refresh from source logs
+  --service-tier <mode>    Codex pricing tier: auto, standard, priority, flex, fast
   --providers <list>       Comma list: claude,codex (aliases: anthropic,openai)
   --claude                 Claude only
   --anthropic              Alias for --claude
@@ -622,6 +740,7 @@ if (subcommand === 'refresh') {
 let sinceDate = null, untilDate = null, showBreakdown = false;
 let fastMode = false, freshMode = false, backgroundRefresh = false;
 let enableClaude = true, enableCodex = true;
+let serviceTierMode = 'auto';
 const claudePassArgs = [];
 for (let i = 0; i < passArgs.length; i++) {
   const a = passArgs[i];
@@ -639,6 +758,17 @@ for (let i = 0; i < passArgs.length; i++) {
     fastMode = true;
   } else if (a === '--fresh') {
     freshMode = true;
+  } else if (a === '--service-tier' && passArgs[i + 1]) {
+    const selection = parseServiceTierSelection(passArgs[i + 1]);
+    if (!selection) {
+      console.error(`Invalid service tier: ${passArgs[i + 1]}. Use auto, standard, priority, flex, or fast.`);
+      process.exit(1);
+    }
+    serviceTierMode = selection;
+    i++;
+  } else if (a === '--service-tier') {
+    console.error('Missing value for --service-tier. Use auto, standard, priority, flex, or fast.');
+    process.exit(1);
   } else if (a === INTERNAL_BACKGROUND_FLAG) {
     backgroundRefresh = true;
   } else if (a === '--providers' && passArgs[i + 1]) {
@@ -696,6 +826,8 @@ const loaderState = {
   cacheDirty: false,
   fresh: freshMode,
   fast: fastMode,
+  serviceTierOverride: serviceTierMode,
+  defaultServiceTier: enableCodex && serviceTierMode === 'auto' ? readCodexConfigServiceTier() : null,
 };
 
 const claudePromise = enableClaude
@@ -763,12 +895,14 @@ for (const [dateKey, models] of codexByGroup) {
   if (!merged.has(dateKey)) merged.set(dateKey, { models: [], dayTotal: 0 });
   const bucket = merged.get(dateKey);
 
-  for (const [modelName, m] of models) {
-    const cost = computeCost('codex', modelName, m.input, m.cacheRead, m.output, 0);
+  for (const [, m] of models) {
+    const cost = computeCost('codex', m.model, m.input, m.cacheRead, m.output, 0, m.serviceTier);
     bucket.dayTotal += cost;
     bucket.models.push({
       provider: 'codex',
-      model: modelName,
+      model: formatCodexModelLabel(m.model, m.serviceTier),
+      baseModel: m.model,
+      serviceTier: m.serviceTier,
       input: m.input,
       output: m.output,
       cacheWrite: 0,
@@ -815,7 +949,7 @@ if (showBreakdown) {
 
     for (let mi = 0; mi < bucket.models.length; mi++) {
       const m = bucket.models[mi];
-      const pricing = getModelPricing(m.provider, m.model);
+      const pricing = getModelPricing(m.provider, m.baseModel || m.model, m.serviceTier);
       const marker = m.provider === 'claude' ? CYAN + '\u25cf' + RESET : MAGENTA + '\u25cf' + RESET;
 
       const cats = [];

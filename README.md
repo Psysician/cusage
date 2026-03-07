@@ -40,6 +40,8 @@ cusage --until 20260228     # filter until date
 cusage --breakdown          # cost breakdown with per-token rates
 cusage --fast               # cached snapshot first (spawns background refresh)
 cusage --fresh              # force full refresh from source logs
+cusage --service-tier fast  # Codex priority pricing (fast alias)
+cusage --service-tier flex  # force Codex flex pricing
 cusage --providers codex    # codex only
 cusage --providers openai   # alias for codex
 cusage --openai             # codex only (GPT models)
@@ -57,7 +59,7 @@ cusage --help               # show help
 Cache path defaults to:
 
 ```bash
-~/.cache/cusage/cache-v2.json
+~/.cache/cusage/cache-v3.json
 ```
 
 Override with:
@@ -85,7 +87,7 @@ CUSAGE_CACHE_PATH=/some/path/cache.json cusage
 
 ## Pricing
 
-Hardcoded pricing (updated Feb 2026):
+Hardcoded pricing (updated Mar 2026):
 
 | Model | Input | Cached Input | Output |
 |-------|-------|-------------|--------|
@@ -93,8 +95,20 @@ Hardcoded pricing (updated Feb 2026):
 | gpt-5-mini | $0.25/MTok | $0.025/MTok | $2.00/MTok |
 | gpt-5 / gpt-5.1 / codex | $1.25/MTok | $0.125/MTok | $10.00/MTok |
 | gpt-5.2 / gpt-5.3 / codex | $1.75/MTok | $0.175/MTok | $14.00/MTok |
+| gpt-5.4 | $2.50/MTok | $0.25/MTok | $15.00/MTok |
 | gpt-5-pro | $15.00/MTok | — | $120.00/MTok |
 | gpt-5.2-pro | $21.00/MTok | — | $168.00/MTok |
+
+Codex service-tier multipliers:
+
+| Tier | Multiplier |
+|------|------------|
+| standard | 1x |
+| priority | 2x |
+| flex | 0.5x |
+| fast | alias for `priority` |
+
+`--service-tier auto` is the default for Codex pricing. `cusage` uses exact session tier metadata when available, otherwise falls back to `~/.codex/config.toml` (`service_tier = "fast"` maps to priority pricing). Fallback tier pricing is only applied for sessions dated `2026-03-06` or later; older sessions stay on standard pricing unless exact metadata is present.
 
 Claude pricing: standard view uses `ccusage` (LiteLLM), `--breakdown` uses estimated rates.
 
