@@ -5,7 +5,7 @@ import { closeSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, st
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import process from 'node:process';
-const CACHE_VERSION = 3;
+const CACHE_VERSION = 4;
 const INTERNAL_BACKGROUND_FLAG = '--background-refresh';
 const SERVICE_TIER_SUPPORTED_FROM = '2026-03-06';
 
@@ -401,6 +401,8 @@ function findJsonlFiles(dir) {
 function createCodexState() {
   return {
     sessionTimestamp: null,
+    sessionId: null,
+    familyId: null,
     model: null,
     serviceTier: null,
     lastTotal: null,
@@ -410,7 +412,11 @@ function createCodexState() {
 function applyCodexObjectToState(obj, state) {
   if (!obj || typeof obj !== 'object') return;
 
-  if (obj.type === 'session_meta' && obj.payload?.timestamp) state.sessionTimestamp = obj.payload.timestamp;
+  if (obj.type === 'session_meta') {
+    if (obj.payload?.timestamp) state.sessionTimestamp = obj.payload.timestamp;
+    if (obj.payload?.id) state.sessionId = obj.payload.id;
+    if (obj.payload?.forked_from_id) state.familyId = obj.payload.forked_from_id;
+  }
   if (obj.type === 'turn_context' && obj.payload?.model) state.model = obj.payload.model;
 
   if (obj.type === 'event_msg' && obj.payload?.type === 'token_count') {
@@ -452,6 +458,8 @@ function summarizeCodexState(state) {
 
   return {
     sessionTimestamp: state.sessionTimestamp,
+    sessionId: state.sessionId,
+    familyId: state.familyId || state.sessionId,
     model,
     serviceTier: state.serviceTier,
     input: nonCachedInput,
@@ -515,41 +523,87 @@ function inDateRange(groupMode, dateKey, sinceDate, untilDate) {
   return true;
 }
 
+function getCodexFamilyId(summary, fallbackId = 'codex-unknown-family') {
+  return summary.familyId || summary.sessionId || fallbackId;
+}
+
+function updateCodexFamilyBucket(bucket, summary) {
+  bucket.input = Math.max(bucket.input, summary.input);
+  bucket.cacheRead = Math.max(bucket.cacheRead, summary.cacheRead);
+  bucket.output = Math.max(bucket.output, summary.output);
+  bucket.reasoning = Math.max(bucket.reasoning, summary.reasoning);
+  bucket.total = bucket.input + bucket.cacheRead + bucket.output;
+}
+
+function collapseCodexFamilyBuckets(byGroupFamilies) {
+  const byGroup = new Map();
+
+  for (const [dateKey, families] of byGroupFamilies) {
+    const models = new Map();
+
+    for (const family of families.values()) {
+      const modelKey = `${family.model}\x1f${family.serviceTier}`;
+      if (!models.has(modelKey)) {
+        models.set(modelKey, {
+          model: family.model,
+          serviceTier: family.serviceTier,
+          input: 0,
+          cacheWrite: 0,
+          cacheRead: 0,
+          output: 0,
+          reasoning: 0,
+          total: 0,
+        });
+      }
+
+      const modelBucket = models.get(modelKey);
+      modelBucket.input += family.input;
+      modelBucket.cacheRead += family.cacheRead;
+      modelBucket.output += family.output;
+      modelBucket.reasoning += family.reasoning;
+      modelBucket.total += family.total;
+    }
+
+    byGroup.set(dateKey, models);
+  }
+
+  return byGroup;
+}
+
 function pushCodexSummary(byGroup, summary, groupMode, sinceDate, untilDate, options = {}) {
   const dateKey = groupMode === 'monthly' ? toMonthKey(summary.sessionTimestamp) : toISODate(summary.sessionTimestamp);
   if (!dateKey) return;
   if (!inDateRange(groupMode, dateKey, sinceDate, untilDate)) return;
 
   const serviceTier = resolveCodexServiceTier(summary, options);
-  const modelKey = `${summary.model}\x1f${serviceTier}`;
+  const familyId = getCodexFamilyId(summary, options.familyFallbackId);
+  const familyKey = `${familyId}\x1f${summary.model}\x1f${serviceTier}`;
 
   if (!byGroup.has(dateKey)) byGroup.set(dateKey, new Map());
-  const models = byGroup.get(dateKey);
-  if (!models.has(modelKey)) {
-    models.set(modelKey, {
+  const families = byGroup.get(dateKey);
+  if (!families.has(familyKey)) {
+    families.set(familyKey, {
+      familyId,
       model: summary.model,
       serviceTier,
-      input: 0,
+      input: summary.input,
       cacheWrite: 0,
-      cacheRead: 0,
-      output: 0,
-      reasoning: 0,
-      total: 0,
+      cacheRead: summary.cacheRead,
+      output: summary.output,
+      reasoning: summary.reasoning,
+      total: summary.input + summary.cacheRead + summary.output,
     });
+    return;
   }
-  const m = models.get(modelKey);
-  m.input += summary.input;
-  m.cacheRead += summary.cacheRead;
-  m.output += summary.output;
-  m.reasoning += summary.reasoning;
-  m.total += summary.total;
+
+  updateCodexFamilyBucket(families.get(familyKey), summary);
 }
 
 function loadCodexDirect(sinceDate, untilDate, groupMode, options = {}) {
   const codexHome = process.env.CODEX_HOME?.trim() || join(homedir(), '.codex');
   const sessionsDir = join(codexHome, 'sessions');
   const files = findJsonlFiles(sessionsDir);
-  const byGroup = new Map();
+  const byGroupFamilies = new Map();
 
   const cacheFiles = options.cache?.codex?.files ?? {};
   const fresh = options.fresh === true;
@@ -579,7 +633,10 @@ function loadCodexDirect(sinceDate, untilDate, groupMode, options = {}) {
     }
 
     if (!summary) continue;
-    pushCodexSummary(byGroup, summary, groupMode, sinceDate, untilDate, options);
+    pushCodexSummary(byGroupFamilies, summary, groupMode, sinceDate, untilDate, {
+      ...options,
+      familyFallbackId: file,
+    });
   }
 
   for (const file of Object.keys(cacheFiles)) {
@@ -589,7 +646,7 @@ function loadCodexDirect(sinceDate, untilDate, groupMode, options = {}) {
     }
   }
 
-  return byGroup;
+  return collapseCodexFamilyBuckets(byGroupFamilies);
 }
 
 // ─── Claude data via ccusage --json ───────────────────────

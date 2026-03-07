@@ -59,7 +59,7 @@ cusage --help               # show help
 Cache path defaults to:
 
 ```bash
-~/.cache/cusage/cache-v3.json
+~/.cache/cusage/cache-v4.json
 ```
 
 Override with:
@@ -84,6 +84,7 @@ CUSAGE_CACHE_PATH=/some/path/cache.json cusage
 - **Claude Code**: Delegates to `ccusage --json` (reads `~/.claude/projects/**/*.jsonl`)
 - **OpenAI Codex**: Reads `~/.codex/sessions/**/*.jsonl` directly, taking only the final cumulative `total_token_usage` per file
   - Uses per-file index cache and a fast head/tail parser with full-parse fallback
+  - Automatically de-overlaps forked subagent session families before daily/monthly aggregation
 
 ## Pricing
 
