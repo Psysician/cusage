@@ -1,0 +1,7 @@
+#!/usr/bin/env node
+import { readFileSync, writeFileSync } from 'node:fs';
+
+if (process.env.CUSAGE_BACKGROUND_MARKER) {
+  writeFileSync(process.env.CUSAGE_BACKGROUND_MARKER, 'ccusage-called\n', 'utf8');
+}
+process.stdout.write(readFileSync(process.env.CCUSAGE_FIXTURE_PATH, 'utf8'));

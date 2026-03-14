@@ -1,0 +1,26 @@
+{
+  "baseline": {
+    "description": "Mixed Claude and Codex fixture with forked-family Codex overlap for daily, monthly, and breakdown goldens.",
+    "claudeReport": "claude/report.json",
+    "expected": {
+      "daily": "expected/daily.txt",
+      "monthly": "expected/monthly.txt",
+      "breakdown": "expected/breakdown.txt"
+    }
+  },
+  "cache-hit": {
+    "description": "Warm-cache fixture where --fast stays on seeded cache data and --fresh rebuilds from fixture source files.",
+    "claudeReport": "claude/report.json",
+    "cacheTemplate": "cache/cache-v4.json",
+    "expected": {
+      "fresh": "expected/fresh.txt"
+    }
+  },
+  "cache-fallback": {
+    "description": "Claude refresh failure with cached fallback data and deterministic stderr expectations.",
+    "cacheTemplate": "cache/cache-v4.json",
+    "expected": {
+      "stderr": "expected/stderr.txt"
+    }
+  }
+}

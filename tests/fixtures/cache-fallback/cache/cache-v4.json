@@ -1,0 +1,48 @@
+{
+  "version": 4,
+  "claude": {
+    "commands": {
+      "daily::--offline": {
+        "fingerprint": "stale-fingerprint",
+        "updatedAt": "2026-03-10T10:15:00.000Z",
+        "data": {
+          "daily": [
+            {
+              "date": "2026-03-10",
+              "totalCost": 0.0042,
+              "modelBreakdowns": [
+                {
+                  "modelName": "claude-3-7-sonnet-20250219",
+                  "inputTokens": 900,
+                  "outputTokens": 94,
+                  "cacheCreationTokens": 0,
+                  "cacheReadTokens": 300,
+                  "cost": 0.0042
+                }
+              ]
+            }
+          ],
+          "monthly": [
+            {
+              "month": "2026-03",
+              "totalCost": 0.0042,
+              "modelBreakdowns": [
+                {
+                  "modelName": "claude-3-7-sonnet-20250219",
+                  "inputTokens": 900,
+                  "outputTokens": 94,
+                  "cacheCreationTokens": 0,
+                  "cacheReadTokens": 300,
+                  "cost": 0.0042
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  },
+  "codex": {
+    "files": {}
+  }
+}

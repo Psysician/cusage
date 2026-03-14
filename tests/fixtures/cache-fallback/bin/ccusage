@@ -1,0 +1,8 @@
+#!/usr/bin/env node
+import { writeFileSync } from 'node:fs';
+
+if (process.env.CUSAGE_BACKGROUND_MARKER) {
+  writeFileSync(process.env.CUSAGE_BACKGROUND_MARKER, 'ccusage-called\n', 'utf8');
+}
+process.stderr.write('fixture failure\n');
+process.exit(1);

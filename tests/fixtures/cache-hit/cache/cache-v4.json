@@ -1,0 +1,65 @@
+{
+  "version": 4,
+  "claude": {
+    "commands": {
+      "daily::--offline": {
+        "fingerprint": "fixture-cache-hit",
+        "updatedAt": "2026-03-09T09:30:00.000Z",
+        "data": {
+          "daily": [
+            {
+              "date": "2026-03-08",
+              "totalCost": 0.0024,
+              "modelBreakdowns": [
+                {
+                  "modelName": "claude-3-7-sonnet-20250219",
+                  "inputTokens": 400,
+                  "outputTokens": 76,
+                  "cacheCreationTokens": 0,
+                  "cacheReadTokens": 200,
+                  "cost": 0.0024
+                }
+              ]
+            }
+          ],
+          "monthly": [
+            {
+              "month": "2026-03",
+              "totalCost": 0.0024,
+              "modelBreakdowns": [
+                {
+                  "modelName": "claude-3-7-sonnet-20250219",
+                  "inputTokens": 400,
+                  "outputTokens": 76,
+                  "cacheCreationTokens": 0,
+                  "cacheReadTokens": 200,
+                  "cost": 0.0024
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  },
+  "codex": {
+    "files": {
+      "__SCENARIO_ROOT__/codex-home/sessions/2026/03/root-session.jsonl": {
+        "mtimeMs": 0,
+        "size": 0,
+        "summary": {
+          "sessionTimestamp": "2026-03-08T08:00:00.000Z",
+          "sessionId": "cache-hit-root",
+          "familyId": "cache-hit-root",
+          "model": "gpt-5.4",
+          "serviceTier": "standard",
+          "input": 50,
+          "cacheRead": 100,
+          "output": 10,
+          "reasoning": 1,
+          "total": 160
+        }
+      }
+    }
+  }
+}

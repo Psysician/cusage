@@ -1,0 +1,3 @@
+{"type":"session_meta","payload":{"timestamp":"2026-03-09T09:00:00.000Z","id":"cache-hit-root"}}
+{"type":"turn_context","payload":{"model":"gpt-5.4"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"metadata":{"service_tier":"standard"},"total_token_usage":{"input_tokens":2400,"cached_input_tokens":2000,"output_tokens":120,"reasoning_output_tokens":20,"total_tokens":2520}}}}

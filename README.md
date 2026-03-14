@@ -68,6 +68,23 @@ Override with:
 CUSAGE_CACHE_PATH=/some/path/cache.json cusage
 ```
 
+## Regression Harness
+
+The packaged CLI now has fixture-backed end-to-end coverage under `tests/e2e` and `tests/fixtures`.
+
+- `tests/fixtures/baseline`: mixed Claude and Codex fixtures for daily, monthly, breakdown, and provider-filter goldens
+- `tests/fixtures/cache-hit`: seeded cache data for `--fast`, `--fresh`, and explicit background refresh checks
+- `tests/fixtures/cache-fallback`: deterministic fallback stderr when Claude refresh fails
+- `tests/support/run-cli.mjs`: shared helper that runs `bin/cusage.mjs` with fixture-scoped `HOME`, `CLAUDE_HOME`, `CODEX_HOME`, `CUSAGE_CACHE_PATH`, and `PATH`
+
+Run the full suite with:
+
+```bash
+node --test
+```
+
+The harness is intentionally regression-first: it locks the current packaged CLI behavior before any later module split or architecture changes.
+
 ## Columns
 
 | Column | Description |
